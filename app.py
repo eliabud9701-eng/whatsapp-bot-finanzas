@@ -1,11 +1,12 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from twilio.twiml.messaging_response import MessagingResponse
 import json
 import os
 
 app = Flask(__name__)
+CORS(app)
 
-# Base de datos simple en archivo JSON
 DB_FILE = 'finanzas.json'
 
 def cargar_datos():
@@ -41,17 +42,66 @@ def guardar_datos(datos):
 def fmt(n):
     return f'${int(n):,}'
 
+# ── API ENDPOINTS ─────────────────────────────────────────────
+
+@app.route('/api/datos', methods=['GET'])
+def get_datos():
+    datos = cargar_datos()
+    return jsonify(datos)
+
+@app.route('/api/datos', methods=['POST'])
+def set_datos():
+    datos = request.json
+    guardar_datos(datos)
+    return jsonify({'ok': True})
+
+@app.route('/api/ingreso', methods=['POST'])
+def add_ingreso():
+    datos = cargar_datos()
+    body = request.json
+    datos['ingresos'].append(body)
+    guardar_datos(datos)
+    return jsonify({'ok': True})
+
+@app.route('/api/gasto-pagado', methods=['POST'])
+def add_gasto_pagado():
+    datos = cargar_datos()
+    gasto = request.json.get('gasto')
+    if gasto and gasto not in datos['gastos_pagados']:
+        datos['gastos_pagados'].append(gasto)
+    guardar_datos(datos)
+    return jsonify({'ok': True})
+
+@app.route('/api/deuda-pago', methods=['POST'])
+def add_deuda_pago():
+    datos = cargar_datos()
+    body = request.json
+    nombre = body.get('nombre')
+    monto = body.get('monto', 0)
+    if nombre in datos['deudas']:
+        datos['deudas'][nombre]['saldo'] = max(0, datos['deudas'][nombre]['saldo'] - monto)
+    guardar_datos(datos)
+    return jsonify({'ok': True, 'saldo': datos['deudas'].get(nombre, {}).get('saldo', 0)})
+
+@app.route('/api/reset', methods=['POST'])
+def reset_mes():
+    datos = cargar_datos()
+    datos['ingresos'] = []
+    datos['gastos_pagados'] = []
+    guardar_datos(datos)
+    return jsonify({'ok': True})
+
+# ── WHATSAPP BOT ──────────────────────────────────────────────
+
 def procesar_comando(mensaje, datos):
     msg = mensaje.lower().strip()
-    
-    # RESUMEN
+
     if any(x in msg for x in ['resumen', 'estado', 'como voy', 'cómo voy']):
         total_ingresos = sum(i['monto'] for i in datos['ingresos'])
         total_deudas = sum(d['saldo'] for d in datos['deudas'].values())
         jomesh = int(total_ingresos * 0.2)
         total_gastos_fijos = sum(datos['gastos_fijos'].values())
         disponible = total_ingresos - jomesh - total_gastos_fijos
-        
         return f"""📊 *RESUMEN FINANCIERO*
 
 💰 Ingresos del mes: {fmt(total_ingresos)}
@@ -59,40 +109,28 @@ def procesar_comando(mensaje, datos):
 🧾 Gastos fijos: {fmt(total_gastos_fijos)}
 💵 Disponible: {fmt(disponible)}
 
-💳 Total deudas: {fmt(total_deudas)}
+💳 Total deudas: {fmt(total_deudas)}"""
 
-Escribe *deudas* para ver el detalle de cada deuda."""
-
-    # DEUDAS
     elif any(x in msg for x in ['deudas', 'cuanto debo', 'cuánto debo']):
         lines = ['💳 *MIS DEUDAS*\n']
         for nombre, info in datos['deudas'].items():
             if info['saldo'] > 0:
                 meses = int(info['saldo'] / info['pago']) if info['pago'] > 0 else '?'
-                lines.append(f"• {nombre}: {fmt(info['saldo'])} ({meses} meses)")
+                lines.append(f"• {nombre}: {fmt(info['saldo'])} (~{meses} meses)")
         return '\n'.join(lines)
 
-    # INGRESO - "entró 50000 venta" o "ingreso 50000 comision"
-    elif any(x in msg for x in ['entró', 'entro', 'ingreso', 'ingresó', 'ingreso']):
+    elif any(x in msg for x in ['entró', 'entro', 'ingreso', 'ingresó']):
         palabras = msg.split()
         monto = 0
-        for p in palabras:
+        fuente = 'Sin especificar'
+        for i, p in enumerate(palabras):
             try:
                 monto = float(p.replace(',', '').replace('$', ''))
+                fuente = ' '.join(palabras[i+1:]) if i+1 < len(palabras) else 'Sin especificar'
                 break
             except:
                 continue
         if monto > 0:
-            # Extraer fuente (todo después del monto)
-            fuente = mensaje
-            for p in palabras:
-                try:
-                    float(p.replace(',', '').replace('$', ''))
-                    idx = palabras.index(p)
-                    fuente = ' '.join(palabras[idx+1:]) if idx+1 < len(palabras) else 'Sin especificar'
-                    break
-                except:
-                    continue
             datos['ingresos'].append({'monto': monto, 'fuente': fuente})
             guardar_datos(datos)
             total = sum(i['monto'] for i in datos['ingresos'])
@@ -102,11 +140,9 @@ Escribe *deudas* para ver el detalle de cada deuda."""
 💰 {fmt(monto)} de {fuente}
 🕍 Jomesh a dar: {fmt(jomesh)}
 📊 Total ingresos del mes: {fmt(total)}"""
-        else:
-            return '❌ No entendí el monto. Escribe por ejemplo: *entró 50000 venta cliente*'
+        return '❌ No entendí el monto. Ej: *entró 50000 venta cliente*'
 
-    # PAGO DEUDA - "pagué 10000 a victor" o "abono 10000 amex"
-    elif any(x in msg for x in ['pagué', 'pague', 'abono', 'aboné', 'aboner']):
+    elif any(x in msg for x in ['pagué', 'pague', 'abono', 'aboné']):
         palabras = msg.split()
         monto = 0
         for p in palabras:
@@ -115,38 +151,32 @@ Escribe *deudas* para ver el detalle de cada deuda."""
                 break
             except:
                 continue
-        
+
         deuda_encontrada = None
         for nombre in datos['deudas'].keys():
             if nombre.lower() in msg:
                 deuda_encontrada = nombre
                 break
-        
+
         if monto > 0 and deuda_encontrada:
             datos['deudas'][deuda_encontrada]['saldo'] = max(0, datos['deudas'][deuda_encontrada]['saldo'] - monto)
             guardar_datos(datos)
-            saldo_restante = datos['deudas'][deuda_encontrada]['saldo']
-            return f"""✅ *Pago registrado*
+            return f"""✅ *Pago a {deuda_encontrada}*
 
-💳 {deuda_encontrada}: -{fmt(monto)}
-📊 Saldo restante: {fmt(saldo_restante)}"""
-        elif monto > 0:
-            return f'❌ No encontré la deuda. Las deudas disponibles son: {", ".join(datos["deudas"].keys())}'
-        else:
-            return '❌ No entendí el monto. Escribe por ejemplo: *pagué 10000 a Victor*'
+💳 -{fmt(monto)}
+📊 Saldo restante: {fmt(datos['deudas'][deuda_encontrada]['saldo'])}"""
 
-    # PAGAR GASTO - "pagué renta" o "pague seguro"
-    elif any(x in msg for x in ['pagué', 'pague']):
-        for gasto in datos['gastos_fijos'].keys():
-            if gasto.lower() in msg:
-                if gasto not in datos['gastos_pagados']:
-                    datos['gastos_pagados'].append(gasto)
-                    guardar_datos(datos)
-                return f'✅ *{gasto}* marcado como pagado — {fmt(datos["gastos_fijos"][gasto])}'
-        return '❌ No encontré ese gasto. Escribe *gastos* para ver la lista.'
+        if monto == 0:
+            for gasto in datos['gastos_fijos'].keys():
+                if gasto.lower() in msg:
+                    if gasto not in datos['gastos_pagados']:
+                        datos['gastos_pagados'].append(gasto)
+                        guardar_datos(datos)
+                    return f'✅ *{gasto}* marcado como pagado — {fmt(datos["gastos_fijos"][gasto])}'
 
-    # GASTOS
-    elif any(x in msg for x in ['gastos', 'que debo pagar', 'qué debo pagar']):
+        return '❌ No entendí. Ej: *pagué renta* o *pagué 10000 a Victor*'
+
+    elif any(x in msg for x in ['gastos', 'que debo pagar']):
         lines = ['🧾 *GASTOS FIJOS*\n']
         for nombre, monto in datos['gastos_fijos'].items():
             estado = '✅' if nombre in datos['gastos_pagados'] else '⏳'
@@ -156,39 +186,31 @@ Escribe *deudas* para ver el detalle de cada deuda."""
         lines.append(f'\n💰 Pagado: {fmt(pagado)} / {fmt(total)}')
         return '\n'.join(lines)
 
-    # JOMESH
     elif 'jomesh' in msg:
         total_ingresos = sum(i['monto'] for i in datos['ingresos'])
         jomesh = int(total_ingresos * 0.2)
         return f"""🕍 *JOMESH*
 
 💰 Ingresos del mes: {fmt(total_ingresos)}
-🕍 Jomesh a dar (20%): {fmt(jomesh)}
+🕍 Jomesh a dar (20%): {fmt(jomesh)}"""
 
-Escribe *pagué jomesh 10000 sinagoga* para registrar un pago."""
-
-    # RESET MES
     elif any(x in msg for x in ['nuevo mes', 'reset', 'reiniciar']):
         datos['ingresos'] = []
         datos['gastos_pagados'] = []
         guardar_datos(datos)
-        return '✅ Mes reiniciado. Ingresos y pagos borrados. Las deudas se mantienen.'
+        return '✅ Mes reiniciado. Ingresos y pagos borrados.'
 
-    # AYUDA
     else:
         return """🤖 *BOT DE FINANZAS*
 
-Comandos disponibles:
-
-📊 *resumen* — ver tu situación del mes
-💳 *deudas* — ver saldo de cada deuda
-🧾 *gastos* — ver gastos fijos del mes
-🕍 *jomesh* — ver cuánto debes dar
+📊 *resumen* — situación del mes
+💳 *deudas* — saldo de cada deuda
+🧾 *gastos* — gastos fijos del mes
+🕍 *jomesh* — cuánto debes dar
 
 💰 *entró 50000 venta* — registrar ingreso
-✅ *pagué renta* — marcar gasto como pagado
-💳 *pagué 10000 a Victor* — abonar a deuda
-
+✅ *pagué renta* — marcar gasto pagado
+💳 *pagué 10000 a Victor* — abonar deuda
 🔄 *nuevo mes* — reiniciar el mes"""
 
 @app.route('/whatsapp', methods=['POST'])
@@ -196,7 +218,6 @@ def whatsapp():
     mensaje = request.form.get('Body', '').strip()
     datos = cargar_datos()
     respuesta = procesar_comando(mensaje, datos)
-    
     resp = MessagingResponse()
     resp.message(respuesta)
     return str(resp)
