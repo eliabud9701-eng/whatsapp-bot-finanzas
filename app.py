@@ -94,7 +94,8 @@ Responde SOLO con el JSON, sin texto adicional."""
             }
         )
         result = response.json()
-        content = result['choices'][0]['message']['content'].strip()
+        print(f'Groq response: {result}')
+        content = result.get('choices', [{}])[0].get('message', {}).get('content', '') if result.get('choices') else str(result)
         # Limpiar posibles backticks
         content = content.replace('```json', '').replace('```', '').strip()
         return json.loads(content)
